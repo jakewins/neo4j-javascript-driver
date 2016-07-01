@@ -20,7 +20,12 @@ import StreamObserver from './internal/stream-observer';
 import Result from './result';
 
 /**
- * Represents a transaction in the Neo4j database.
+ * Represents a transaction in the Neo4j database. This is a powerful class,
+ * giving raw access to the {@link #commit()} and {@link rollback()} primitives.
+ *
+ * However, writing code that safely uses these primitives can be surprisingly hard.
+ * Because of this, the Driver provides a second transaction class, {@link LambdaTransaction},
+ * which works as syntax sugar on top of this and makes it easier to write safe code.
  *
  * @access public
  */
@@ -89,6 +94,79 @@ class Transaction {
   _onError() {
     this._onClose();
     this._state = _states.FAILED;
+  }
+}
+
+/**
+ * Represents a transaction in the Neo4j database. This is syntax-sugar on top of
+ * {@link Transaction}, making it easier to write transactional code safely.
+ *
+ * Unless you understand the difference between this and {@link Transaction}, and
+ * know what you are doing, you should use this class over the other.
+ *
+ * @access public
+ */
+class LambdaTransaction {
+  constructor(tx) {
+    this._tx = tx;
+
+    // This always points to the last promise we've made to the client; it is updated each time
+    // the user calls `run`
+    this._tailPromise = tx;
+    this._state = 'schrodinger';
+
+    // Bind success and failure to `this`, so they can be used like
+    // tx.run('..').then(tx.success)
+    let _success = this.success, _failure = this.failure;
+    this.success = () => _success();
+    this.failure = (e) => _failure();
+  }
+
+  /**
+   * Run Cypher statement
+   * Could be called with a statement object i.e.: {statement: "MATCH ...", parameters: {param: 1}}
+   * or with the statem ent and parameters as separate arguments.
+   * @param {mixed} statement - Cypher statement to execute
+   * @param {Object} parameters - Map with parameters to use in statement
+   * @return {Result} - New Result
+   */
+  run(statement, parameters) {
+    return this._tailPromise = this._tx.run(statement, parameters);
+  }
+
+  success() {
+    // Only allow marking as successful if there's never been any other state change
+    // eg. don't allow success to override a prior call to failure.
+    if(this._state === 'schrodinger') {
+      this._state = 'alive';
+    }
+  }
+
+  failure() {
+    this._state = 'dead';
+  }
+
+  // This should be called to "wrap up", it will append the transaction finalization code to the current
+  // tail promise.
+  _finish() {
+    // The below catch/then construct works the same way `finally` would;
+    // the `catch` will catch any error in the promise chain, and the `then`
+    // after it will, because of that, always get executed.
+    let error = undefined;
+    this._tailPromise
+      .catch( (e) => {
+        error = e;
+      })
+      .then( () => {
+        if(error) {
+          this._tx.rollback();
+          throw error;
+        } else if( this._state !== 'alive' ) {
+          return this._tx.rollback();
+        } else {
+          return this._tx.commit();
+        }
+      })
   }
 }
 
@@ -204,3 +282,4 @@ function _runDiscardAll(msg, conn, observer) {
 }
 
 export default Transaction;
+export {Transaction, LambdaTransaction}

@@ -19,7 +19,7 @@
 
 import StreamObserver from './internal/stream-observer';
 import Result from './result';
-import Transaction from './transaction';
+import {Transaction, LambdaTransaction} from './transaction';
 import {newError} from "./error";
 
 /**
@@ -83,6 +83,40 @@ class Session {
 
     this._hasTx = true;
     return new Transaction(this._conn, () => {this._hasTx = false});
+  }
+
+  /**
+   * Execute a group of statements in a transaction. All statements in Neo4j are transactional - meaning if you
+   * just `run` a statement on it's own, it will be implicitly wrapped in a transaction. Hence, this method is only
+   * useful if you want to run several statements in the <b>same</b> transaction, or if you want to execute business
+   * logic after you issue a statement to decide if you want to commit it or not.
+   *
+   * This method takes a function that describes the work you want to do transactionally. When you are done with whatever
+   * operations you want to perform, and want to commit, you should call {@link LambdaTransaction#success()}. This will
+   * mark the transaction as successful, and it will automatically be committed.
+   *
+   * By using this mechanism, if there are any exceptions or other errors anywhere in your code,
+   * {@link LambdaTransaction#success()} won't get called, and the transaction will then not be committed.
+   *
+   * If you want to force a transaction to roll back, simply call {@link LambdaTransaction#failure()}. This will force
+   * the transaction to roll back, even if you call `success()` later.
+   *
+   * @param {function(LambdaTransaction)} unitOfWork - A function that performs the statements you'd like to run, using
+   *                                                   the {@link LambdaTransaction transaction} object it is given as
+   *                                                   an argument. If you want the transcation to commit, call
+   *                                                   `success` on it.
+   * @returns {Promise} - Promise that completes when the transaction is committed
+   */
+  transactionally(unitOfWork) {
+    let tx = new LambdaTransaction(this.beginTransaction());
+    try {
+      unitOfWork(tx);
+    } catch(e) {
+      // Note: we do not rethrow here; that would force the user to both try/catch *and* .catch() with the promise
+      // method. Instead, we normalize all error management through Promise#catch()
+      tx._tailPromise.then(Promise.reject(e));
+    }
+    return tx._finish();
   }
 
   /**
